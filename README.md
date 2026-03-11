@@ -134,7 +134,10 @@ programs.ai-agents.skills = [ inputs.skills-core ];
 
 ### Git URLs
 
-Specify a git URL directly in the module config:
+Specify a git URL directly in the module config. Git URL entries are
+**cloned at Home Manager activation time** as the current user, so they
+have access to SSH keys and git credential helpers. This makes them
+suitable for private repositories that the nix daemon cannot access.
 
 ```nix
 programs.ai-agents.skills = [
@@ -147,7 +150,7 @@ programs.ai-agents.skills = [
 
   {
     url = "git@github.com:corp/internal-skills.git";
-    rev = "abc123def456789...";
+    ref = "main";
   }
 ];
 ```
@@ -158,25 +161,29 @@ programs.ai-agents.skills = [
 |---|---|---|
 | `url` | Yes | Git repository URL (HTTPS or SSH) |
 | `ref` | No | Branch or tag name |
-| `rev` | No | Exact commit SHA |
+| `rev` | No | Exact commit SHA (checks out this exact commit) |
 
-### Pure Eval and Pinning
+Cloned repos are cached in `~/.cache/nix-ai-agent-skills/repos/` and
+updated on each activation.
 
-- **With `rev`** -- Works in pure eval. Fully reproducible.
-- **With only `ref` (no `rev`)** -- Requires `--impure` flag.
-- **Neither `ref` nor `rev`** -- Requires `--impure`. Fetches default branch HEAD.
+### Precedence
 
-Flake inputs are always pinned via `flake.lock` and unaffected.
+Git URL skills are deployed **after** store skills (flake inputs/paths).
+On name collision, **git skills override store skills**. Within each
+group, later entries override earlier ones.
 
 ## How Skills Merging Works
 
 1. **Discovery** -- Each skills source is scanned recursively for `SKILL.md`
    files at any depth. The parent directory of each `SKILL.md` becomes the
    skill name.
-2. **Merge** -- Skills from all sources are merged into a single flat
-   directory. Later entries override earlier ones on name collision (last wins).
-3. **Deploy** -- The merged skills directory is symlinked into each enabled
-   agent's config path via Home Manager.
+2. **Store skills (build-time)** -- Flake input and path entries are merged
+   into a single derivation in the nix store. Later store entries override
+   earlier ones on name collision. Deployed via Home Manager file management.
+3. **Git skills (activation-time)** -- Git URL entries are cloned/updated as
+   the user during Home Manager activation. Symlinked from the cache
+   directory into each agent's skills path. Git skills override store skills
+   on name collision.
 
 ## Configuration Reference
 
@@ -197,8 +204,9 @@ Flake inputs are always pinned via `flake.lock` and unaffected.
 
 - **Type:** `listOf (either path { url; ref?; rev?; })`
 - **Default:** `[]`
-- **Description:** Ordered list of skills sources. Later entries take priority
-  on name conflicts.
+- **Description:** List of skills sources. Path/flake entries are resolved at
+  build time; git URL entries are cloned at activation time as the user.
+  Git skills override store skills on name collision.
 
 ### `programs.ai-agents.mcpServers`
 
@@ -246,8 +254,12 @@ nix flake update skills-core  # update a single skills repo
 
 ### Git URL Entries
 
-Manually update `rev` or `ref` in your Home Manager config. There is no
-lock file for git URL entries -- `rev` is the pinning mechanism.
+Git URL entries are fetched on every activation. To pin a specific version,
+set `rev` to a commit SHA. To clear the local cache and force a fresh clone:
+
+```bash
+rm -rf ~/.cache/nix-ai-agent-skills/repos/
+```
 
 ## License
 
