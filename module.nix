@@ -22,23 +22,41 @@ let
     name = "skillSource";
     description = "path, URL string, or { source, ref?, rev?, include?, exclude? }";
     check =
-      x: builtins.isPath x || builtins.isString x || (builtins.isAttrs x && (x ? source || x ? outPath));
+      x:
+      builtins.isPath x
+      || builtins.isString x
+      || (
+        builtins.isAttrs x
+        && (x ? source || x ? outPath)
+        && (!(x ? include) || builtins.isList x.include)
+        && (!(x ? exclude) || builtins.isList x.exclude)
+        && (!(x ? ref) || builtins.isString x.ref)
+        && (!(x ? rev) || builtins.isString x.rev)
+      );
   };
 
   # Detect whether a string value is a git remote URL.
-  # Includes http:// for internal mirrors that serve git over plain HTTP.
   isGitSource =
     s:
     builtins.isString s
     && (
       lib.hasPrefix "https://" s
-      || lib.hasPrefix "http://" s
+      || (
+        lib.hasPrefix "http://" s
+        && lib.warn "programs.ai-agents: HTTP git source '${s}' is insecure; prefer HTTPS." true
+      )
       || lib.hasPrefix "git@" s
       || lib.hasPrefix "ssh://" s
-      || lib.hasPrefix "git://" s
+      || (
+        lib.hasPrefix "git://" s
+        && lib.warn "programs.ai-agents: git:// protocol is unencrypted; prefer SSH or HTTPS." true
+      )
       || lib.hasPrefix "git+ssh://" s
       || lib.hasPrefix "git+https://" s
     );
+
+  # Detect whether a git URL requires SSH authentication.
+  isSSHSource = s: lib.hasPrefix "git@" s || lib.hasPrefix "ssh://" s || lib.hasPrefix "git+ssh://" s;
 
   isGitSkill =
     entry:
@@ -51,6 +69,15 @@ let
 
   storeSkills = builtins.filter (e: !isGitSkill e) cfg.skills;
   gitSkillEntries = builtins.filter isGitSkill cfg.skills;
+
+  # Whether any git skill source uses an SSH URL.
+  hasSSHSkills = builtins.any (
+    e:
+    let
+      src = if builtins.isString e then e else e.source or "";
+    in
+    isSSHSource src
+  ) gitSkillEntries;
 
   mcpServerType = lib.types.submodule {
     freeformType = jsonFormat.type;
@@ -187,31 +214,80 @@ let
       agentDirsStr = lib.concatMapStringsSep " " (d: ''"${d}"'') agentDirs;
       normalizedGitSkills = map normalizeGitSkill gitSkillEntries;
 
+      # Export SSH_AUTH_SOCK if configured. The value is stored in a
+      # shell variable via escapeShellArg to prevent injection, then
+      # used in ${:-} to not clobber any value already in the environment.
+      sshSetup = lib.optionalString (cfg.sshAuthSock != null) ''
+        _nix_ssh_sock=${lib.escapeShellArg cfg.sshAuthSock}
+        export SSH_AUTH_SOCK="''${SSH_AUTH_SOCK:-$_nix_ssh_sock}"
+      '';
+
+      # Runtime pre-flight warning when SSH sources exist but socket is unset.
+      sshPreFlight = lib.optionalString hasSSHSkills ''
+        if [ -z "''${SSH_AUTH_SOCK:-}" ]; then
+          echo "Warning: SSH_AUTH_SOCK is not set; SSH git skill sources will likely fail." >&2
+          echo "  Set home.sessionVariables.SSH_AUTH_SOCK or programs.ai-agents.sshAuthSock." >&2
+        fi
+      '';
+
+      # Trust model: activation-time git clones are NOT integrity-verified
+      # like flake inputs (which use content hashes in flake.lock). A
+      # compromised remote or MITM on insecure transports (http://, git://)
+      # can deliver arbitrary content into agent skill directories. Pin with
+      # `rev` for reproducibility; prefer flake inputs for strong integrity.
       cloneSnippets = lib.concatMapStrings (
         entry:
         let
-          urlHash = builtins.hashString "sha256" entry.source;
+          urlHash = builtins.hashString "sha256" "${entry.source}#${entry.ref}#${entry.rev}";
+          escapedSource = lib.escapeShellArg entry.source;
         in
         ''
           _repo="${cacheDir}/repos/${urlHash}"
           if [ -d "$_repo/.git" ]; then
-            ${pkgs.git}/bin/git -C "$_repo" fetch --quiet 2>/dev/null || \
-              echo "Warning: failed to fetch ${entry.source}" >&2
+            ${pkgs.git}/bin/git -C "$_repo" fetch --quiet ${
+              lib.optionalString (entry.rev == "") "--depth 1"
+            } || \
+              echo 'Warning: failed to fetch' ${escapedSource} >&2
             ${
               if entry.rev != "" then
                 ''
-                  ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg entry.rev} 2>/dev/null
+                  ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg entry.rev}
+                ''
+              else if entry.ref != "" then
+                ''
+                  # Ensure correct branch/tag is checked out (fixes detached HEAD from prior rev pin)
+                  if ${pkgs.git}/bin/git -C "$_repo" show-ref --verify --quiet "refs/tags/${lib.escapeShellArg entry.ref}" 2>/dev/null; then
+                    # ref is a tag -- checkout only, no pull (tags don't track upstream)
+                    ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg entry.ref}
+                  else
+                    # ref is a branch -- checkout and pull
+                    ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg entry.ref} 2>/dev/null || true
+                    ${pkgs.git}/bin/git -C "$_repo" pull --quiet || \
+                      echo 'Warning: failed to update' ${escapedSource} >&2
+                  fi
                 ''
               else
                 ''
-                  ${pkgs.git}/bin/git -C "$_repo" pull --quiet 2>/dev/null || true
+                  # Detect and checkout default branch (fixes detached HEAD from prior rev pin)
+                  _default_branch="$(${pkgs.git}/bin/git -C "$_repo" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')" || true
+                  ${pkgs.git}/bin/git -C "$_repo" checkout --quiet "''${_default_branch:-main}" 2>/dev/null || true
+                  ${pkgs.git}/bin/git -C "$_repo" pull --quiet || \
+                    echo 'Warning: failed to update' ${escapedSource} >&2
                 ''
             }
           else
             ${pkgs.git}/bin/git clone --quiet \
-              ${lib.optionalString (entry.ref != "") "--branch ${lib.escapeShellArg entry.ref}"} \
-              ${lib.escapeShellArg entry.source} "$_repo" 2>/dev/null || \
-              echo "Warning: failed to clone ${entry.source}" >&2
+              ${lib.optionalString (entry.rev == "") "--depth 1"} \
+              ${
+                lib.optionalString (
+                  entry.rev == "" && entry.ref != ""
+                ) "--single-branch --branch ${lib.escapeShellArg entry.ref}"
+              } \
+              ${
+                lib.optionalString (entry.rev != "" && entry.ref != "") "--branch ${lib.escapeShellArg entry.ref}"
+              } \
+              ${escapedSource} "$_repo" || \
+              echo 'Warning: failed to clone' ${escapedSource} '(is SSH_AUTH_SOCK set?)' >&2
             ${lib.optionalString (entry.rev != "") ''
               ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg entry.rev}
             ''}
@@ -222,7 +298,7 @@ let
       deploySnippets = lib.concatMapStrings (
         entry:
         let
-          urlHash = builtins.hashString "sha256" entry.source;
+          urlHash = builtins.hashString "sha256" "${entry.source}#${entry.ref}#${entry.rev}";
           filterSnippet = mkSkillFilter { inherit (entry) include exclude; };
         in
         ''
@@ -240,6 +316,8 @@ let
       ) normalizedGitSkills;
     in
     ''
+      ${sshSetup}
+      ${sshPreFlight}
       _AGENT_DIRS=(${agentDirsStr})
       mkdir -p "${cacheDir}/repos"
 
@@ -298,9 +376,9 @@ in
           and `exclude` (blacklist).
 
         When `source` is a git URL, the repo is cloned at activation
-        time with access to SSH keys and git credentials, making it
-        suitable for private repositories. `ref` and `rev` are only
-        valid for git sources.
+        time as the current user. SSH-based URLs (`git@`, `ssh://`)
+        require `SSH_AUTH_SOCK`; see `programs.ai-agents.sshAuthSock`.
+        `ref` and `rev` are only valid for git sources.
 
         When `source` is a path or derivation, it is resolved at build
         time and deployed via Home Manager file management.
@@ -317,6 +395,24 @@ in
         Skills are discovered recursively, where any SKILL.md files at any
         nested depth are found and their parent directory becomes the
         skill name in the merged output.
+      '';
+    };
+
+    sshAuthSock = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      # `or null` is Nix attribute-access-with-fallback syntax:
+      # returns the value if the key exists in the attrset, null otherwise.
+      default = config.home.sessionVariables.SSH_AUTH_SOCK or null;
+      defaultText = lib.literalExpression "config.home.sessionVariables.SSH_AUTH_SOCK or null";
+      description = ''
+        Path to the SSH agent socket, forwarded into the activation
+        environment for git skill sources that use SSH (`git@`, `ssh://`).
+
+        Defaults to `home.sessionVariables.SSH_AUTH_SOCK` when set.
+        Override explicitly if your SSH agent socket is managed outside
+        Home Manager (e.g. 1Password via launchd, gpg-agent).
+
+        Set to `null` to disable (HTTPS-only git sources don't need this).
       '';
     };
 
