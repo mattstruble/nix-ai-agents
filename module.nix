@@ -20,12 +20,35 @@ let
 
   skillType = lib.mkOptionType {
     name = "skillSource";
-    description = "path or { url, ref?, rev? }";
+    description = "path, URL string, or { source, ref?, rev?, include?, exclude? }";
     check =
-      x: builtins.isPath x || builtins.isString x || (builtins.isAttrs x && (x ? url || x ? outPath));
+      x: builtins.isPath x || builtins.isString x || (builtins.isAttrs x && (x ? source || x ? outPath));
   };
 
-  isGitSkill = entry: builtins.isAttrs entry && entry ? url;
+  # Detect whether a string value is a git remote URL.
+  # Includes http:// for internal mirrors that serve git over plain HTTP.
+  isGitSource =
+    s:
+    builtins.isString s
+    && (
+      lib.hasPrefix "https://" s
+      || lib.hasPrefix "http://" s
+      || lib.hasPrefix "git@" s
+      || lib.hasPrefix "ssh://" s
+      || lib.hasPrefix "git://" s
+      || lib.hasPrefix "git+ssh://" s
+      || lib.hasPrefix "git+https://" s
+    );
+
+  isGitSkill =
+    entry:
+    (builtins.isString entry && isGitSource entry)
+    || (builtins.isAttrs entry && entry ? source && isGitSource entry.source);
+
+  # Validate that a skill name contains only safe characters for shell interpolation.
+  # Matches: letters, digits, dots, underscores, hyphens.
+  isValidSkillName = name: builtins.match "[a-zA-Z0-9._-]+" name != null;
+
   storeSkills = builtins.filter (e: !isGitSkill e) cfg.skills;
   gitSkillEntries = builtins.filter isGitSkill cfg.skills;
 
@@ -40,18 +63,100 @@ let
     };
   };
 
-  resolvedStoreSkills = storeSkills;
+  # Normalize a store skill entry into { path, include, exclude }
+  # Handles: bare paths, bare derivations, and { source; include?; exclude?; }
+  normalizeStoreSkill =
+    entry:
+    if builtins.isAttrs entry && entry ? source then
+      {
+        path = entry.source;
+        include = entry.include or null;
+        exclude = entry.exclude or null;
+      }
+    else
+      {
+        path = entry;
+        include = null;
+        exclude = null;
+      };
+
+  # Normalize a git skill entry into { source, ref, rev, include, exclude }
+  # Handles: bare URL strings and { source; ref?; rev?; include?; exclude?; }
+  normalizeGitSkill =
+    entry:
+    if builtins.isString entry then
+      {
+        source = entry;
+        ref = "";
+        rev = "";
+        include = null;
+        exclude = null;
+      }
+    else
+      {
+        source = entry.source;
+        ref = entry.ref or "";
+        rev = entry.rev or "";
+        include = entry.include or null;
+        exclude = entry.exclude or null;
+      };
+
+  # Generate a bash case snippet that filters by skill name.
+  # - include non-null + non-empty: only matching names pass through
+  # - include = []: skip all (empty whitelist matches nothing)
+  # - exclude non-null + non-empty: matching names are skipped
+  # - exclude = []: no filter (empty blacklist excludes nothing)
+  # - both null: no filter (empty string)
+  mkSkillFilter =
+    { include, exclude }:
+    if include != null then
+      if include == [ ] then
+        "continue"
+      else
+        let
+          patterns = lib.concatMapStringsSep "|" (n: ''"${n}"'') include;
+        in
+        ''
+          case "$name" in
+            ${patterns}) ;;
+            *) continue ;;
+          esac
+        ''
+    else if exclude != null then
+      if exclude == [ ] then
+        ""
+      else
+        let
+          patterns = lib.concatMapStringsSep "|" (n: ''"${n}"'') exclude;
+        in
+        ''
+          case "$name" in
+            ${patterns}) continue ;;
+            *) ;;
+          esac
+        ''
+    else
+      "";
+
+  resolvedStoreSkills = map normalizeStoreSkill storeSkills;
 
   mergedSkills = pkgs.runCommandLocal "merged-ai-agent-skills" { } ''
     mkdir -p $out
-    ${lib.concatMapStringsSep "\n" (src: ''
-      find "${src}" -name "SKILL.md" -type f | while read -r skillfile; do
-        skill_dir="$(dirname "$skillfile")"
-        name="$(basename "$skill_dir")"
-        rm -rf "$out/$name"
-        cp -rL "$skill_dir" "$out/$name"
-      done
-    '') resolvedStoreSkills}
+    ${lib.concatMapStringsSep "\n" (
+      skill:
+      let
+        filterSnippet = mkSkillFilter { inherit (skill) include exclude; };
+      in
+      ''
+        find "${skill.path}" -name "SKILL.md" -type f | while read -r skillfile; do
+          skill_dir="$(dirname "$skillfile")"
+          name="$(basename "$skill_dir")"
+          ${filterSnippet}
+          rm -rf "$out/$name"
+          cp -rL "$skill_dir" "$out/$name"
+        done
+      ''
+    ) resolvedStoreSkills}
   '';
 
   # Build final opencode config with shared MCPs merged in.
@@ -80,23 +185,22 @@ let
     let
       agentDirs = map agentSkillsAbsPath cfg.agents;
       agentDirsStr = lib.concatMapStringsSep " " (d: ''"${d}"'') agentDirs;
+      normalizedGitSkills = map normalizeGitSkill gitSkillEntries;
 
       cloneSnippets = lib.concatMapStrings (
         entry:
         let
-          urlHash = builtins.hashString "sha256" entry.url;
-          ref = entry.ref or "";
-          rev = entry.rev or "";
+          urlHash = builtins.hashString "sha256" entry.source;
         in
         ''
           _repo="${cacheDir}/repos/${urlHash}"
           if [ -d "$_repo/.git" ]; then
             ${pkgs.git}/bin/git -C "$_repo" fetch --quiet 2>/dev/null || \
-              echo "Warning: failed to fetch ${entry.url}" >&2
+              echo "Warning: failed to fetch ${entry.source}" >&2
             ${
-              if rev != "" then
+              if entry.rev != "" then
                 ''
-                  ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg rev} 2>/dev/null
+                  ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg entry.rev} 2>/dev/null
                 ''
               else
                 ''
@@ -105,33 +209,35 @@ let
             }
           else
             ${pkgs.git}/bin/git clone --quiet \
-              ${lib.optionalString (ref != "") "--branch ${lib.escapeShellArg ref}"} \
-              ${lib.escapeShellArg entry.url} "$_repo" 2>/dev/null || \
-              echo "Warning: failed to clone ${entry.url}" >&2
-            ${lib.optionalString (rev != "") ''
-              ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg rev}
+              ${lib.optionalString (entry.ref != "") "--branch ${lib.escapeShellArg entry.ref}"} \
+              ${lib.escapeShellArg entry.source} "$_repo" 2>/dev/null || \
+              echo "Warning: failed to clone ${entry.source}" >&2
+            ${lib.optionalString (entry.rev != "") ''
+              ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg entry.rev}
             ''}
           fi
         ''
-      ) gitSkillEntries;
+      ) normalizedGitSkills;
 
       deploySnippets = lib.concatMapStrings (
         entry:
         let
-          urlHash = builtins.hashString "sha256" entry.url;
+          urlHash = builtins.hashString "sha256" entry.source;
+          filterSnippet = mkSkillFilter { inherit (entry) include exclude; };
         in
         ''
           if [ -d "${cacheDir}/repos/${urlHash}" ]; then
             find "${cacheDir}/repos/${urlHash}" -name "SKILL.md" -type f | while read -r skillfile; do
               skill_dir="$(dirname "$skillfile")"
               name="$(basename "$skill_dir")"
+              ${filterSnippet}
               for _dir in "''${_AGENT_DIRS[@]}"; do
                 ln -snf "$skill_dir" "$_dir/$name"
               done
             done
           fi
         ''
-      ) gitSkillEntries;
+      ) normalizedGitSkills;
     in
     ''
       _AGENT_DIRS=(${agentDirsStr})
@@ -182,17 +288,31 @@ in
       description = ''
         Ordered list of skills sources. Each entry is either:
 
-        - A path (typically a flake input with `flake = false`), or
-        - An attrset with `url` (required), `ref` (optional branch/tag),
-          and `rev` (optional commit SHA) for git-based skills.
+        - A path or derivation (typically a flake input with
+          `flake = false`), deployed at build time via Home Manager
+          file management.
+        - A git URL string (https://, git@, ssh://, etc.), cloned at
+          Home Manager activation time as the user.
+        - An attrset with `source` (required), plus optional `ref`
+          (branch/tag), `rev` (commit SHA), `include` (whitelist),
+          and `exclude` (blacklist).
 
-        Path/flake entries are resolved at build time and deployed via
-        Home Manager file management.
+        When `source` is a git URL, the repo is cloned at activation
+        time with access to SSH keys and git credentials, making it
+        suitable for private repositories. `ref` and `rev` are only
+        valid for git sources.
 
-        Git URL entries are cloned at Home Manager activation time,
-        running as the user with access to SSH keys and git credentials.
-        This makes them suitable for private repositories. Git skills
-        override store skills on name collision.
+        When `source` is a path or derivation, it is resolved at build
+        time and deployed via Home Manager file management.
+
+        Attrset entries may optionally include an `include` list (deploy
+        only the named skills) or an `exclude` list (deploy all skills
+        except the named ones). These are mutually exclusive -- specifying
+        both is an error. Skill names correspond to the basename of
+        directories containing SKILL.md files within the source.
+
+        Git skills override store skills on name collision. Within each
+        group, later entries override earlier ones.
 
         Skills are discovered recursively, where any SKILL.md files at any
         nested depth are found and their parent directory becomes the
@@ -250,7 +370,45 @@ in
             assertion = !(cfg.opencode.agentsFile != null && cfg.opencode.agentsText != null);
             message = "programs.ai-agents.opencode.agentsFile and agentsText are mutually exclusive.";
           }
-        ];
+        ]
+        # include and exclude are mutually exclusive per skill entry
+        ++ (lib.imap0 (i: entry: {
+          assertion = !(builtins.isAttrs entry && (entry ? include) && (entry ? exclude));
+          message = "programs.ai-agents.skills[${toString i}]: 'include' and 'exclude' are mutually exclusive; specify one or neither.";
+        }) cfg.skills)
+        # ref and rev are only meaningful for git sources
+        ++ (lib.imap0 (i: entry: {
+          assertion =
+            !(
+              builtins.isAttrs entry
+              && (entry ? ref || entry ? rev)
+              && !(entry ? source && isGitSource entry.source)
+            );
+          message = "programs.ai-agents.skills[${toString i}]: 'ref' and 'rev' are only valid for git sources.";
+        }) cfg.skills)
+        # bare string entries must be valid git URLs, not arbitrary strings
+        ++ (lib.imap0 (i: entry: {
+          assertion = !(builtins.isString entry && !isGitSource entry);
+          message = "programs.ai-agents.skills[${toString i}]: bare string '${entry}' is not a recognised git URL. Use a path literal or { source = ...; } instead.";
+        }) cfg.skills)
+        # include/exclude entries must be valid skill names (alphanumeric, dots, underscores, hyphens)
+        ++ (lib.concatLists (
+          lib.imap0 (
+            i: entry:
+            let
+              includeNames = if builtins.isAttrs entry && entry ? include then entry.include else [ ];
+              excludeNames = if builtins.isAttrs entry && entry ? exclude then entry.exclude else [ ];
+            in
+            (lib.imap0 (j: name: {
+              assertion = isValidSkillName name;
+              message = "programs.ai-agents.skills[${toString i}].include[${toString j}]: '${name}' contains invalid characters. Skill names must match [a-zA-Z0-9._-]+.";
+            }) includeNames)
+            ++ (lib.imap0 (j: name: {
+              assertion = isValidSkillName name;
+              message = "programs.ai-agents.skills[${toString i}].exclude[${toString j}]: '${name}' contains invalid characters. Skill names must match [a-zA-Z0-9._-]+.";
+            }) excludeNames)
+          ) cfg.skills
+        ));
       }
 
       # Store skills deployment (build-time, via Home Manager file management)

@@ -114,7 +114,7 @@ The module system merges this with the shared config automatically.
 
 ## Skills Sources
 
-Skills can be provided as either **flake inputs** or **git URLs**.
+Skills can be provided as either **flake inputs** or **git sources**.
 
 ### Flake Inputs
 
@@ -132,45 +132,91 @@ inputs.skills-core = {
 programs.ai-agents.skills = [ inputs.skills-core ];
 ```
 
-### Git URLs
+### Git Sources
 
-Specify a git URL directly in the module config. Git URL entries are
+Specify a git URL directly in the module config. Git source entries are
 **cloned at Home Manager activation time** as the current user, so they
 have access to SSH keys and git credential helpers. This makes them
 suitable for private repositories that the nix daemon cannot access.
+
+A bare URL string is shorthand for `{ source = "..."; }`:
 
 ```nix
 programs.ai-agents.skills = [
   inputs.skills-core
 
+  # Bare URL string (shorthand)
+  "https://github.com/me/my-skills"
+
+  # Attrset with ref pinning
   {
-    url = "https://github.com/me/my-skills";
+    source = "https://github.com/me/my-skills";
     ref = "v1.0.0";
   }
 
+  # SSH URL
   {
-    url = "git@github.com:corp/internal-skills.git";
+    source = "git@github.com:corp/internal-skills.git";
     ref = "main";
   }
 ];
 ```
 
-**Git URL options:**
+**Git source options:**
 
 | Field | Required | Description |
 |---|---|---|
-| `url` | Yes | Git repository URL (HTTPS or SSH) |
-| `ref` | No | Branch or tag name |
-| `rev` | No | Exact commit SHA (checks out this exact commit) |
+| `source` | Yes | Git URL (HTTPS or SSH), path, or derivation |
+| `ref` | No | Branch or tag name (git sources only) |
+| `rev` | No | Exact commit SHA (git sources only) |
+| `include` | No | List of skill names to deploy (whitelist). Mutually exclusive with `exclude`. |
+| `exclude` | No | List of skill names to skip (blacklist). Mutually exclusive with `include`. |
 
 Cloned repos are cached in `~/.cache/nix-ai-agent-skills/repos/` and
 updated on each activation.
 
 ### Precedence
 
-Git URL skills are deployed **after** store skills (flake inputs/paths).
+Git-source skills are deployed **after** store skills (flake inputs/paths).
 On name collision, **git skills override store skills**. Within each
-group, later entries override earlier ones.
+group, later entries override earlier ones. Filtering (via `include` or
+`exclude`) happens before deployment, not after.
+
+### Filtering Skills
+
+Each skills entry can optionally specify an `include` list (whitelist) or
+an `exclude` list (blacklist) to control which discovered skills get
+deployed. These are mutually exclusive -- specifying both is an error.
+
+Skill names correspond to the directory name containing the `SKILL.md` file.
+
+```nix
+programs.ai-agents.skills = [
+  # Deploy only specific skills from a flake input
+  {
+    source = inputs.skills-core;
+    include = [ "git-commit" "test-design" ];
+  }
+
+  # Deploy all skills except a few from a git source
+  {
+    source = "https://github.com/me/my-skills";
+    exclude = [ "deprecated-skill" "experimental" ];
+  }
+
+  # No filtering (deploy everything) -- these are equivalent:
+  inputs.other-skills
+  "https://github.com/org/more-skills"
+  { source = inputs.yet-more-skills; }
+];
+```
+
+**Edge cases:**
+
+- `include = []` -- empty whitelist matches nothing; no skills deployed
+  from that source.
+- `exclude = []` -- empty blacklist excludes nothing; all skills deployed.
+- A nonexistent skill name in `include` or `exclude` is silently ignored.
 
 ## How Skills Merging Works
 
@@ -180,7 +226,7 @@ group, later entries override earlier ones.
 2. **Store skills (build-time)** -- Flake input and path entries are merged
    into a single derivation in the nix store. Later store entries override
    earlier ones on name collision. Deployed via Home Manager file management.
-3. **Git skills (activation-time)** -- Git URL entries are cloned/updated as
+3. **Git skills (activation-time)** -- Git source entries are cloned/updated as
    the user during Home Manager activation. Symlinked from the cache
    directory into each agent's skills path. Git skills override store skills
    on name collision.
@@ -202,11 +248,13 @@ group, later entries override earlier ones.
 
 ### `programs.ai-agents.skills`
 
-- **Type:** `listOf (either path { url; ref?; rev?; })`
+- **Type:** `listOf (path | URL string | { source; ref?; rev?; include?; exclude?; })`
 - **Default:** `[]`
 - **Description:** List of skills sources. Path/flake entries are resolved at
   build time; git URL entries are cloned at activation time as the user.
-  Git skills override store skills on name collision.
+  Git skills override store skills on name collision. Attrset entries may
+  include `include` (whitelist) or `exclude` (blacklist) to filter which
+  skills are deployed from that source.
 
 ### `programs.ai-agents.mcpServers`
 
@@ -252,9 +300,9 @@ nix flake update              # update all inputs
 nix flake update skills-core  # update a single skills repo
 ```
 
-### Git URL Entries
+### Git Source Entries
 
-Git URL entries are fetched on every activation. To pin a specific version,
+Git source entries are fetched on every activation. To pin a specific version,
 set `rev` to a commit SHA. To clear the local cache and force a fresh clone:
 
 ```bash
