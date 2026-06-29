@@ -284,6 +284,12 @@ let
       agentDirs = map agentSkillsAbsPath cfg.agents;
       agentDirsStr = lib.concatMapStringsSep " " (d: ''"${d}"'') agentDirs;
 
+      # Profile dirs under opencode/skill-profiles/<name>/ and .../all/
+      opencodeProfilesBase = "${config.xdg.configHome}/opencode/skill-profiles";
+
+      # Space-separated list of declared profile names for use in a bash for-loop (build-time)
+      profileNamesStr = lib.concatMapStringsSep " " (n: ''"${n}"'') (builtins.attrNames cfg.opencode.profiles);
+
       # Export SSH_AUTH_SOCK if configured. The value is stored in a
       # shell variable via escapeShellArg to prevent injection, then
       # used in ${:-} to not clobber any value already in the environment.
@@ -365,11 +371,31 @@ let
         ''
       ) gitSkillEntries;
 
-      deploySnippets = lib.concatMapStrings (
+      # Deploy snippet for a single git entry.
+      # Base entries (profiles=null): symlink into opencode base dir + claude/cursor dirs.
+      # Profiled entries: symlink into each targeted skill-profiles/<name>/ + claude/cursor dirs.
+      # All entries also land in skill-profiles/all/ (opencode only).
+      hasOpencode = builtins.elem "opencode" cfg.agents;
+
+      mkDeploySnippet =
         entry:
         let
           urlHash = builtins.hashString "sha256" "${entry.source}#${entry.ref}#${entry.rev}";
           filterSnippet = mkSkillFilter { inherit (entry) include exclude; };
+          # Non-opencode agent dirs (claude, cursor) — always get all git skills
+          nonOpencodeAgentDirs = builtins.filter (d: d != agentSkillsAbsPath "opencode") agentDirs;
+          nonOpencodeStr = lib.concatMapStringsSep " " (d: ''"${d}"'') nonOpencodeAgentDirs;
+          # Per-profile target dirs for opencode (build-time known from entry.profiles)
+          opencodeTargets =
+            if !hasOpencode then
+              [ ]
+            else if entry.profiles == null then
+              # base: opencode base skills dir
+              [ (agentSkillsAbsPath "opencode") ]
+            else
+              # profiled: one dir per targeted profile
+              map (p: "${opencodeProfilesBase}/${p}") entry.profiles;
+          opencodeTargetsStr = lib.concatMapStringsSep " " (d: ''"${d}"'') opencodeTargets;
         in
         ''
           if [ -d "${cacheDir}/repos/${urlHash}" ]; then
@@ -377,13 +403,29 @@ let
               skill_dir="$(dirname "$skillfile")"
               name="$(basename "$skill_dir")"
               ${filterSnippet}
-              for _dir in "''${_AGENT_DIRS[@]}"; do
-                ln -snf "$skill_dir" "$_dir/$name"
-              done
+              ${lib.optionalString (opencodeTargets != []) ''
+                # Deploy to opencode target dirs (base or per-profile)
+                for _dir in ${opencodeTargetsStr}; do
+                  mkdir -p "$_dir"
+                  ln -snf "$skill_dir" "$_dir/$name"
+                done
+                ${lib.optionalString (cfg.opencode.profiles != { }) ''
+                  # Deploy to skill-profiles/all/ (opencode)
+                  mkdir -p "${opencodeProfilesBase}/all"
+                  ln -snf "$skill_dir" "${opencodeProfilesBase}/all/$name"
+                ''}
+              ''}
+              # Deploy to non-opencode agent dirs (claude, cursor) — always all skills
+              ${lib.optionalString (nonOpencodeAgentDirs != []) ''
+                for _dir in ${nonOpencodeStr}; do
+                  ln -snf "$skill_dir" "$_dir/$name"
+                done
+              ''}
             done
           fi
-        ''
-      ) gitSkillEntries;
+        '';
+
+      deploySnippets = lib.concatMapStrings mkDeploySnippet gitSkillEntries;
     in
     ''
       ${sshSetup}
@@ -397,7 +439,9 @@ let
       done
 
       # Clean old git-managed symlinks (those pointing to cache dir)
+      # Covers: agent base dirs, skill-profiles/<name>/, skill-profiles/all/
       for _dir in "''${_AGENT_DIRS[@]}"; do
+        [ -d "$_dir" ] || continue
         for _entry in "$_dir"/*; do
           [ -L "$_entry" ] || continue
           case "$(readlink "$_entry")" in
@@ -405,6 +449,19 @@ let
           esac
         done
       done
+      ${lib.optionalString hasOpencode ''
+        # Clean stale git symlinks from skill-profiles/<name>/ and skill-profiles/all/
+        for _profile_name in ${profileNamesStr} all; do
+          _dir="${opencodeProfilesBase}/$_profile_name"
+          [ -d "$_dir" ] || continue
+          for _entry in "$_dir"/*; do
+            [ -L "$_entry" ] || continue
+            case "$(readlink "$_entry")" in
+              "${cacheDir}"/*) rm -f "$_entry" ;;
+            esac
+          done
+        done
+      ''}
 
       # Clone/update repos
       ${cloneSnippets}
@@ -625,9 +682,15 @@ in
           }
         ]
         # profile names must be safe for use as filesystem path components and derivation names
+        # Require alphanumeric start to exclude ".", "..", and leading-dot/hyphen names
         ++ (lib.mapAttrsToList (profileName: _: {
-          assertion = builtins.match "[a-zA-Z0-9._-]+" profileName != null;
-          message = "programs.ai-agents.opencode.profiles: profile name '${profileName}' contains invalid characters. Use only letters, digits, dots, underscores, and hyphens.";
+          assertion = builtins.match "[a-zA-Z0-9][a-zA-Z0-9._-]*" profileName != null;
+          message = "programs.ai-agents.opencode.profiles: profile name '${profileName}' is invalid. Must start with a letter or digit and contain only letters, digits, dots, underscores, and hyphens.";
+        }) cfg.opencode.profiles)
+        # "all" is reserved for the union skill-profiles/all/ directory
+        ++ (lib.mapAttrsToList (profileName: _: {
+          assertion = profileName != "all";
+          message = "programs.ai-agents.opencode.profiles: 'all' is a reserved profile name.";
         }) cfg.opencode.profiles);
       }
 
@@ -646,8 +709,8 @@ in
               ) (builtins.filter isXdgAgent cfg.agents)
             )
           )
-          # Per-profile directories (only when profiles are declared)
-          // lib.optionalAttrs (cfg.opencode.profiles != { }) (
+          # Per-profile directories (only when profiles are declared and opencode is configured)
+          // lib.optionalAttrs (cfg.opencode.profiles != { } && builtins.elem "opencode" cfg.agents) (
             lib.mapAttrs' (profileName: drv:
               lib.nameValuePair "opencode/skill-profiles/${profileName}" {
                 source = drv;
