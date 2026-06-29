@@ -66,6 +66,11 @@ let
         default = 1000;
         description = "Override order. Lower loads first; higher overrides on name collision.";
       };
+      profiles = lib.mkOption {
+        type = with lib.types; nullOr (listOf str);
+        default = null;
+        description = "Profile names this skill belongs to. null = base (always deployed to default skills directory, backwards-compatible behavior).";
+      };
     };
   };
 
@@ -497,6 +502,18 @@ in
             default = null;
             description = "Inline text content for AGENTS.md.";
           };
+
+          profiles = lib.mkOption {
+            type = lib.types.attrsOf (lib.types.submodule {
+              options.dirs = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = "Directories where this profile activates via direnv.";
+              };
+            });
+            default = { };
+            description = "Named skill profiles. Each profile groups skills deployed to a separate directory and optionally maps to filesystem directories for direnv activation.";
+          };
         };
       };
       default = { };
@@ -559,7 +576,32 @@ in
         ++ (lib.imap0 (i: dir: {
           assertion = lib.hasPrefix "/" dir && builtins.match "[^\n\r]+" dir != null;
           message = "programs.ai-agents.subagents[${toString i}]: must be an absolute path without newlines.";
-        }) cfg.subagents);
+        }) cfg.subagents)
+        # skill profiles must reference declared opencode.profiles names
+        ++ [
+          {
+            assertion = lib.all
+              (entry: entry.profiles == null || lib.all
+                (p: builtins.hasAttr p cfg.opencode.profiles)
+                entry.profiles)
+              (lib.attrValues cfg.skills);
+            message =
+              let
+                badEntries = lib.filter
+                  (entry: entry.profiles != null && lib.any
+                    (p: !builtins.hasAttr p cfg.opencode.profiles)
+                    entry.profiles)
+                  (lib.attrValues cfg.skills);
+                badProfiles = lib.concatMap
+                  (entry: lib.filter
+                    (p: !builtins.hasAttr p cfg.opencode.profiles)
+                    entry.profiles)
+                  badEntries;
+                available = lib.concatStringsSep ", " (builtins.attrNames cfg.opencode.profiles);
+              in
+              "programs.ai-agents: unknown profile(s): ${lib.concatStringsSep ", " (lib.unique badProfiles)}. Available profiles: ${available}";
+          }
+        ];
       }
 
       # Store skills deployment (build-time, via Home Manager file management)
