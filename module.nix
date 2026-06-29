@@ -113,6 +113,10 @@ let
   storeSkills = builtins.filter isStoreSource enabledSkills;
   gitSkillEntries = builtins.filter (e: !isStoreSource e) enabledSkills;
 
+  # Partition store skills by profile membership
+  baseStoreSkills = builtins.filter (s: s.profiles == null) storeSkills;
+  profiledStoreSkills = builtins.filter (s: s.profiles != null) storeSkills;
+
   # Whether any git skill source uses an SSH URL.
   hasSSHSkills = builtins.any (e: builtins.isString e.source && isSSHSource e.source) gitSkillEntries;
 
@@ -164,24 +168,42 @@ let
     else
       "";
 
-  mergedSkills = pkgs.runCommandLocal "merged-ai-agent-skills" { } ''
-    mkdir -p $out
-    ${lib.concatMapStringsSep "\n" (
-      skill:
-      let
-        filterSnippet = mkSkillFilter { inherit (skill) include exclude; };
-      in
-      ''
-        find "${skill.source}" -name "SKILL.md" -type f | while read -r skillfile; do
-          skill_dir="$(dirname "$skillfile")"
-          name="$(basename "$skill_dir")"
-          ${filterSnippet}
-          rm -rf "$out/$name"
-          cp -rL "$skill_dir" "$out/$name"
-        done
-      ''
-    ) storeSkills}
-  '';
+  # Helper: build a merged-skills derivation from a list of skill entries
+  mkMergedSkills =
+    name: skills:
+    pkgs.runCommandLocal name { } ''
+      mkdir -p $out
+      ${lib.concatMapStringsSep "\n" (
+        skill:
+        let
+          filterSnippet = mkSkillFilter { inherit (skill) include exclude; };
+        in
+        ''
+          find "${skill.source}" -name "SKILL.md" -type f | while read -r skillfile; do
+            skill_dir="$(dirname "$skillfile")"
+            name="$(basename "$skill_dir")"
+            ${filterSnippet}
+            rm -rf "$out/$name"
+            cp -rL "$skill_dir" "$out/$name"
+          done
+        ''
+      ) skills}
+    '';
+
+  # Base skills (profiles = null) → deployed to default skills directory
+  mergedBaseSkills = mkMergedSkills "merged-ai-agent-base-skills" baseStoreSkills;
+
+  # Per-profile derivations — one per declared profile, containing only skills targeting it
+  mergedProfileSkills = lib.mapAttrs (
+    profileName: _:
+    let
+      skillsForProfile = builtins.filter (s: builtins.elem profileName s.profiles) profiledStoreSkills;
+    in
+    mkMergedSkills "merged-ai-agent-profile-${profileName}-skills" skillsForProfile
+  ) cfg.opencode.profiles;
+
+  # All skills union (base + all profiles), priority-deduped — for Claude/Cursor
+  mergedAllSkills = mkMergedSkills "merged-ai-agent-all-skills" storeSkills;
 
   # Build final opencode config with shared MCPs merged in.
   # Agent-specific MCPs (from opencode.config.mcp) override shared on name collision.
@@ -601,28 +623,51 @@ in
               in
               "programs.ai-agents: unknown profile(s): ${lib.concatStringsSep ", " (lib.unique badProfiles)}. Available profiles: ${available}";
           }
-        ];
+        ]
+        # profile names must be safe for use as filesystem path components and derivation names
+        ++ (lib.mapAttrsToList (profileName: _: {
+          assertion = builtins.match "[a-zA-Z0-9._-]+" profileName != null;
+          message = "programs.ai-agents.opencode.profiles: profile name '${profileName}' contains invalid characters. Use only letters, digits, dots, underscores, and hyphens.";
+        }) cfg.opencode.profiles);
       }
 
       # Store skills deployment (build-time, via Home Manager file management)
       (lib.mkIf (storeSkills != [ ]) {
         # XDG-managed agents (opencode)
-        xdg.configFile = lib.listToAttrs (
-          map (
-            agent:
-            lib.nameValuePair agentSkillsPath.${agent} {
-              source = mergedSkills;
-              recursive = true;
+        xdg.configFile =
+          lib.optionalAttrs (baseStoreSkills != [ ]) (
+            lib.listToAttrs (
+              map (
+                agent:
+                lib.nameValuePair agentSkillsPath.${agent} {
+                  source = mergedBaseSkills;
+                  recursive = true;
+                }
+              ) (builtins.filter isXdgAgent cfg.agents)
+            )
+          )
+          # Per-profile directories (only when profiles are declared)
+          // lib.optionalAttrs (cfg.opencode.profiles != { }) (
+            lib.mapAttrs' (profileName: drv:
+              lib.nameValuePair "opencode/skill-profiles/${profileName}" {
+                source = drv;
+                recursive = true;
+              }
+            ) mergedProfileSkills
+            // {
+              "opencode/skill-profiles/all" = {
+                source = mergedAllSkills;
+                recursive = true;
+              };
             }
-          ) (builtins.filter isXdgAgent cfg.agents)
-        );
+          );
 
-        # Home-managed agents (claude, cursor)
+        # Home-managed agents (claude, cursor) — receive all skills (base + profiled)
         home.file = lib.listToAttrs (
           map (
             agent:
             lib.nameValuePair agentSkillsPath.${agent} {
-              source = mergedSkills;
+              source = mergedAllSkills;
               recursive = true;
             }
           ) (builtins.filter (a: !isXdgAgent a) cfg.agents)
