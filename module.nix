@@ -593,6 +593,26 @@ in
             default = { };
             description = "Named skill profiles. Each profile groups skills deployed to a separate directory and optionally maps to filesystem directories for direnv activation.";
           };
+
+          resolvedProfiles = lib.mkOption {
+            type = lib.types.attrsOf (lib.types.submodule {
+              options = {
+                path = lib.mkOption {
+                  type = lib.types.str;
+                  readOnly = true;
+                  description = "Absolute runtime path where this profile's skills directory is deployed.";
+                };
+                dirs = lib.mkOption {
+                  type = lib.types.listOf lib.types.str;
+                  readOnly = true;
+                  description = "Filesystem directories that should activate this profile.";
+                };
+              };
+            });
+            readOnly = true;
+            default = { };
+            description = "Resolved profile metadata for downstream consumers (e.g. direnv integration).";
+          };
         };
       };
       default = { };
@@ -764,6 +784,21 @@ in
       (lib.mkIf (cfg.opencode.agentsText != null) {
         xdg.configFile."opencode/AGENTS.md".text = cfg.opencode.agentsText;
       })
+
+      # Expose resolved profile metadata for downstream consumers (e.g. direnv integration)
+      {
+        programs.ai-agents.opencode.resolvedProfiles =
+          (lib.mapAttrs (name: profile: {
+            path = "${config.xdg.configHome}/opencode/skill-profiles/${name}";
+            dirs = profile.dirs;
+          }) cfg.opencode.profiles)
+          // {
+            all = {
+              path = "${config.xdg.configHome}/opencode/skill-profiles/all";
+              dirs = [ ];
+            };
+          };
+      }
     ]
   );
 }
