@@ -7,6 +7,10 @@ skills aggregation, config file generation, and shared MCP server definitions.
 
 - **Skills aggregation** -- Merge skills from multiple repositories into a
   single directory, deployed to each enabled agent's config path.
+- **Skill profiles** -- Group skills into named profiles deployed to separate
+  directories, activated per-directory via direnv. An auto-generated `all`
+  profile provides the full union for opencode; claude and cursor always
+  receive the full union in their own skills directories.
 - **Config generation** -- Generate agent config files (e.g., `opencode.json`)
   from Nix with per-host overrides through the module system.
 - **Shared MCP servers** -- Define MCP servers once, automatically inject into
@@ -253,6 +257,113 @@ programs.ai-agents.skills = {
 - `exclude = []` -- empty blacklist excludes nothing; all skills deployed.
 - A nonexistent skill name in `include` or `exclude` is silently ignored.
 
+## Skill Profiles
+
+Skill profiles let you group skills into named sets deployed to separate
+directories. opencode reads skills from a directory you configure per-project
+(e.g., via direnv); claude and cursor always receive the full union in their
+own skills directories.
+
+### Declaring Profiles
+
+```nix
+programs.ai-agents.opencode.profiles = {
+  gamedev = {
+    dirs = [ "~/software/gamedev" "~/software/godot" ];
+  };
+  work = {
+    dirs = [ "~/work" ];
+  };
+};
+```
+
+`dirs` lists the filesystem directories where this profile should activate.
+The actual activation mechanism (e.g. direnv) is wired up separately using
+`resolvedProfiles` -- see [Downstream Integration](#downstream-integration)
+below.
+
+**Constraints:**
+- Profile names must match `[a-zA-Z0-9][a-zA-Z0-9._-]*`.
+- `all` is reserved (auto-generated union -- see below).
+
+### Assigning Skills to Profiles
+
+Add a `profiles` attribute to any skills entry to restrict it to specific
+profiles. Skills without `profiles` are backwards-compatible: they deploy to
+the default `~/.config/opencode/skills/` directory as before.
+
+```nix
+programs.ai-agents.skills = {
+  # No profiles attr -- always deployed to default opencode/skills/ (backwards compat)
+  base-skills = {
+    source = inputs.my-skills;
+    include = [ "git-commit" "software-design" ];
+  };
+
+  # Deployed only to skill-profiles/gamedev/
+  gamedev-skills = {
+    source = inputs.my-skills;
+    include = [ "godot" "love2d" "game-design" ];
+    profiles = [ "gamedev" ];
+  };
+
+  # Same source, multiple profiles
+  shared-skills = {
+    source = inputs.my-skills;
+    include = [ "python-design" "test-design" ];
+    profiles = [ "work" "gamedev" ];
+  };
+};
+```
+
+Profile names in `profiles` must match a name declared in
+`opencode.profiles`; referencing an undeclared profile is a module assertion
+error.
+
+**Edge case:** `profiles = []` (empty list) is distinct from `profiles = null`.
+An empty list causes the skill to be excluded from the base `opencode/skills/`
+directory and from all named profile directories. Behavior in `skill-profiles/all/`
+differs by source type: store sources (flake inputs, paths) still appear in
+`skill-profiles/all/` and in claude/cursor skills directories; git sources are
+excluded from all opencode directories including `skill-profiles/all/`, but still
+appear in claude/cursor skills directories. Use `profiles = null` (the default)
+to deploy to the base opencode skills directory.
+
+### The Auto-Generated `all` Profile
+
+When any profiles are declared, `skill-profiles/all/` is always generated
+containing the union of every skill (base + all profiles), priority-deduped.
+This is an opencode-only path -- claude and cursor always receive the full
+skill union deployed directly to their own skills directories
+(`~/.claude/skills/`, `~/.cursor/skills/`), not from `skill-profiles/all/`.
+
+### Downstream Integration
+
+`config.programs.ai-agents.opencode.resolvedProfiles` exposes the computed
+profile metadata as a read-only attribute for downstream consumers such as a
+direnv integration in your dotfiles:
+
+```nix
+# Available to downstream consumers (e.g. direnv integration in dotfiles)
+config.programs.ai-agents.opencode.resolvedProfiles
+# => {
+#   gamedev = { path = "/home/user/.config/opencode/skill-profiles/gamedev"; dirs = [ "~/software/gamedev" "~/software/godot" ]; };
+#   work    = { path = "/home/user/.config/opencode/skill-profiles/work";    dirs = [ "~/work" ]; };
+#   all     = { path = "/home/user/.config/opencode/skill-profiles/all";     dirs = []; };
+# }
+```
+
+Each entry has:
+- `path` -- absolute path to the profile's skills directory on disk.
+- `dirs` -- filesystem directories that should activate this profile
+  (empty for `all`).
+
+### Backwards Compatibility
+
+Skills without a `profiles` attribute behave identically to before: they are
+deployed to `~/.config/opencode/skills/`. No changes are needed to existing
+configs.
+
 ## How Skills Merging Works
 
 1. **Discovery** -- Each skills source is scanned recursively for `SKILL.md`
@@ -354,7 +465,7 @@ the next `home-manager switch`.
 
 ### `programs.ai-agents.skills`
 
-- **Type:** `attrsOf (submodule { source; enable?; ref?; rev?; include?; exclude?; priority?; })`
+- **Type:** `attrsOf (submodule { source; enable?; ref?; rev?; include?; exclude?; priority?; profiles?; })`
 - **Default:** `{}`
 - **Description:** Named skill sources. Each key is a logical name for the
   source. The `attrsOf` type enables per-host deep merging through the Nix
@@ -363,7 +474,9 @@ the next `home-manager switch`.
   (ascending, default `1000`); lower loads first, higher wins on name
   collision. Path/package entries are resolved at build time; git URL string
   entries are cloned at activation time as the user. Git skills override store
-  skills at equal priority.
+  skills at equal priority. The optional `profiles` list restricts deployment
+  to the named skill profiles; `null` (default) deploys to the default skills
+  directory for backwards compatibility.
 
 ### `programs.ai-agents.subagents`
 
@@ -410,6 +523,34 @@ OpenCode-specific configuration.
 - **Default:** `null`
 - **Description:** Inline text content for AGENTS.md. Mutually exclusive with
   `agentsFile`.
+
+#### `programs.ai-agents.opencode.profiles`
+
+- **Type:** `attrsOf (submodule { dirs; })`
+- **Default:** `{}`
+- **Description:** Named skill profiles. Each key is a profile name (must
+  match `[a-zA-Z0-9][a-zA-Z0-9._-]*`; `all` is reserved). Each profile is
+  deployed to `~/.config/opencode/skill-profiles/<name>/`. The `dirs` list
+  records which filesystem directories should activate this profile -- used by
+  downstream consumers such as a direnv integration. When any profiles are
+  declared, `skill-profiles/all/` is always generated as the union of all
+  skills. Profiles are opencode-specific; if `opencode` is not in `agents`,
+  profile directories are not deployed and `resolvedProfiles` paths will not
+  exist on disk.
+
+#### `programs.ai-agents.opencode.resolvedProfiles`
+
+- **Type:** read-only `attrsOf (submodule { path; dirs; })`
+- **Default:** `{ all = { path = "~/.config/opencode/skill-profiles/all"; dirs = []; }; }`
+- **Description:** Computed profile metadata exposed for downstream consumers.
+  Populated automatically from `opencode.profiles`; do not set directly. Each
+  entry contains the absolute `path` to the profile's skills directory and the
+  `dirs` list from the profile declaration. Always includes an `all` entry
+  (pointing to `skill-profiles/all/`) even when no profiles are declared;
+  however, `skill-profiles/all/` is only deployed to disk when at least one
+  profile is declared. Downstream consumers should check
+  `cfg.opencode.profiles == {}` to detect the no-profiles case rather than
+  testing `resolvedProfiles == {}`.
 
 ## Updating
 
