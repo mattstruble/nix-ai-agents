@@ -599,17 +599,17 @@ in
               options = {
                 path = lib.mkOption {
                   type = lib.types.str;
-                  readOnly = true;
+                  internal = true;
                   description = "Absolute runtime path where this profile's skills directory is deployed.";
                 };
                 dirs = lib.mkOption {
                   type = lib.types.listOf lib.types.str;
-                  readOnly = true;
+                  internal = true;
                   description = "Filesystem directories that should activate this profile.";
                 };
               };
             });
-            readOnly = true;
+            internal = true;
             default = { };
             description = "Resolved profile metadata for downstream consumers (e.g. direnv integration).";
           };
