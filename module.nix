@@ -16,12 +16,14 @@ let
     opencode = "opencode/skills";
     claude = ".claude/skills";
     cursor = ".cursor/skills";
+    pi = ".pi/agent/skills";
   };
 
   agentSubagentsPath = {
     opencode = "opencode/agents";
     claude = ".claude/agents";
     cursor = ".cursor/agents";
+    pi = ".pi/agent/agents";
   };
 
   skillSourceModule = lib.types.submodule {
@@ -288,7 +290,9 @@ let
       opencodeProfilesBase = "${config.xdg.configHome}/opencode/skill-profiles";
 
       # Space-separated list of declared profile names for use in a bash for-loop (build-time)
-      profileNamesStr = lib.concatMapStringsSep " " (n: ''"${n}"'') (builtins.attrNames cfg.opencode.profiles);
+      profileNamesStr = lib.concatMapStringsSep " " (n: ''"${n}"'') (
+        builtins.attrNames cfg.opencode.profiles
+      );
 
       # Export SSH_AUTH_SOCK if configured. The value is stored in a
       # shell variable via escapeShellArg to prevent injection, then
@@ -403,7 +407,7 @@ let
               skill_dir="$(dirname "$skillfile")"
               name="$(basename "$skill_dir")"
               ${filterSnippet}
-              ${lib.optionalString (opencodeTargets != []) ''
+              ${lib.optionalString (opencodeTargets != [ ]) ''
                 # Deploy to opencode target dirs (base or per-profile)
                 for _dir in ${opencodeTargetsStr}; do
                   mkdir -p "$_dir"
@@ -416,7 +420,7 @@ let
                 ''}
               ''}
               # Deploy to non-opencode agent dirs (claude, cursor) — always all skills
-              ${lib.optionalString (nonOpencodeAgentDirs != []) ''
+              ${lib.optionalString (nonOpencodeAgentDirs != [ ]) ''
                 for _dir in ${nonOpencodeStr}; do
                   ln -snf "$skill_dir" "$_dir/$name"
                 done
@@ -481,6 +485,7 @@ in
           "opencode"
           "claude"
           "cursor"
+          "pi"
         ]
       );
       default = [ "opencode" ];
@@ -583,32 +588,36 @@ in
           };
 
           profiles = lib.mkOption {
-            type = lib.types.attrsOf (lib.types.submodule {
-              options.dirs = lib.mkOption {
-                type = lib.types.listOf lib.types.str;
-                default = [ ];
-                description = "Directories where this profile activates via direnv.";
-              };
-            });
+            type = lib.types.attrsOf (
+              lib.types.submodule {
+                options.dirs = lib.mkOption {
+                  type = lib.types.listOf lib.types.str;
+                  default = [ ];
+                  description = "Directories where this profile activates via direnv.";
+                };
+              }
+            );
             default = { };
             description = "Named skill profiles. Each profile groups skills deployed to a separate directory and optionally maps to filesystem directories for direnv activation.";
           };
 
           resolvedProfiles = lib.mkOption {
-            type = lib.types.attrsOf (lib.types.submodule {
-              options = {
-                path = lib.mkOption {
-                  type = lib.types.str;
-                  internal = true;
-                  description = "Absolute runtime path where this profile's skills directory is deployed.";
+            type = lib.types.attrsOf (
+              lib.types.submodule {
+                options = {
+                  path = lib.mkOption {
+                    type = lib.types.str;
+                    internal = true;
+                    description = "Absolute runtime path where this profile's skills directory is deployed.";
+                  };
+                  dirs = lib.mkOption {
+                    type = lib.types.listOf lib.types.str;
+                    internal = true;
+                    description = "Filesystem directories that should activate this profile.";
+                  };
                 };
-                dirs = lib.mkOption {
-                  type = lib.types.listOf lib.types.str;
-                  internal = true;
-                  description = "Filesystem directories that should activate this profile.";
-                };
-              };
-            });
+              }
+            );
             internal = true;
             default = { };
             description = "Resolved profile metadata for downstream consumers (e.g. direnv integration).";
@@ -617,6 +626,53 @@ in
       };
       default = { };
       description = "OpenCode agent configuration.";
+    };
+
+    pi = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          config = lib.mkOption {
+            type = jsonFormat.type;
+            default = { };
+            description = ''
+              Configuration attrset serialized to ~/.pi/agent/settings.json.
+              The packages list is merged in from pi.packages.
+            '';
+          };
+
+          systemPromptFile = lib.mkOption {
+            type = lib.types.nullOr lib.types.path;
+            default = null;
+            description = "Path to SYSTEM.md source file, deployed to ~/.pi/agent/SYSTEM.md.";
+          };
+
+          agentsFile = lib.mkOption {
+            type = lib.types.nullOr lib.types.path;
+            default = null;
+            description = "Path to AGENTS.md source file, deployed to ~/.pi/agent/AGENTS.md.";
+          };
+
+          extensions = lib.mkOption {
+            type = lib.types.listOf lib.types.path;
+            default = [ ];
+            description = ''
+              List of paths to .ts extension files. Each is symlinked into
+              ~/.pi/agent/extensions/<basename>.
+            '';
+          };
+
+          packages = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = ''
+              npm package specs merged into the packages array in settings.json
+              and installed via `pi install` during activation.
+            '';
+          };
+        };
+      };
+      default = { };
+      description = "Pi agent configuration.";
     };
   };
 
@@ -679,23 +735,19 @@ in
         # skill profiles must reference declared opencode.profiles names
         ++ [
           {
-            assertion = lib.all
-              (entry: entry.profiles == null || lib.all
-                (p: builtins.hasAttr p cfg.opencode.profiles)
-                entry.profiles)
-              (lib.attrValues cfg.skills);
+            assertion = lib.all (
+              entry:
+              entry.profiles == null || lib.all (p: builtins.hasAttr p cfg.opencode.profiles) entry.profiles
+            ) (lib.attrValues cfg.skills);
             message =
               let
-                badEntries = lib.filter
-                  (entry: entry.profiles != null && lib.any
-                    (p: !builtins.hasAttr p cfg.opencode.profiles)
-                    entry.profiles)
-                  (lib.attrValues cfg.skills);
-                badProfiles = lib.concatMap
-                  (entry: lib.filter
-                    (p: !builtins.hasAttr p cfg.opencode.profiles)
-                    entry.profiles)
-                  badEntries;
+                badEntries = lib.filter (
+                  entry:
+                  entry.profiles != null && lib.any (p: !builtins.hasAttr p cfg.opencode.profiles) entry.profiles
+                ) (lib.attrValues cfg.skills);
+                badProfiles = lib.concatMap (
+                  entry: lib.filter (p: !builtins.hasAttr p cfg.opencode.profiles) entry.profiles
+                ) badEntries;
                 available = lib.concatStringsSep ", " (builtins.attrNames cfg.opencode.profiles);
               in
               "programs.ai-agents: unknown profile(s): ${lib.concatStringsSep ", " (lib.unique badProfiles)}. Available profiles: ${available}";
@@ -731,7 +783,8 @@ in
           )
           # Per-profile directories (only when profiles are declared and opencode is configured)
           // lib.optionalAttrs (cfg.opencode.profiles != { } && builtins.elem "opencode" cfg.agents) (
-            lib.mapAttrs' (profileName: drv:
+            lib.mapAttrs' (
+              profileName: drv:
               lib.nameValuePair "opencode/skill-profiles/${profileName}" {
                 source = drv;
                 recursive = true;
@@ -799,6 +852,58 @@ in
             };
           };
       }
+
+      # Pi: generate settings.json (merges packages into config)
+      (lib.mkIf (builtins.elem "pi" cfg.agents) (
+        let
+          finalPiConfig =
+            if cfg.pi.packages == [ ] then
+              cfg.pi.config
+            else
+              cfg.pi.config
+              // {
+                packages = (cfg.pi.config.packages or [ ]) ++ cfg.pi.packages;
+              };
+        in
+        lib.mkIf (finalPiConfig != { }) {
+          home.file.".pi/agent/settings.json".source = jsonFormat.generate "pi-settings.json" finalPiConfig;
+        }
+      ))
+
+      # Pi: SYSTEM.md
+      (lib.mkIf (builtins.elem "pi" cfg.agents && cfg.pi.systemPromptFile != null) {
+        home.file.".pi/agent/SYSTEM.md".source = cfg.pi.systemPromptFile;
+      })
+
+      # Pi: AGENTS.md
+      (lib.mkIf (builtins.elem "pi" cfg.agents && cfg.pi.agentsFile != null) {
+        home.file.".pi/agent/AGENTS.md".source = cfg.pi.agentsFile;
+      })
+
+      # Pi: extensions — symlink each .ts file by basename
+      (lib.mkIf (builtins.elem "pi" cfg.agents && cfg.pi.extensions != [ ]) {
+        home.file = lib.listToAttrs (
+          map (
+            ext:
+            lib.nameValuePair ".pi/agent/extensions/${builtins.baseNameOf ext}" {
+              source = ext;
+            }
+          ) cfg.pi.extensions
+        );
+      })
+
+      # Pi: install declared packages via activation script
+      (lib.mkIf (builtins.elem "pi" cfg.agents && cfg.pi.packages != [ ]) {
+        home.activation.piInstallPackages = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+          if command -v pi &>/dev/null; then
+            ${lib.concatMapStringsSep "\n" (pkg: ''
+              pi install ${lib.escapeShellArg pkg}
+            '') cfg.pi.packages}
+          else
+            echo "Warning: 'pi' not found in PATH; skipping package installation." >&2
+          fi
+        '';
+      })
     ]
   );
 }
