@@ -909,6 +909,10 @@ in
             ${lib.concatMapStringsSep "\n" (pkg: ''
               pi install ${lib.escapeShellArg pkg}
             '') cfg.pi.packages}
+            # Approve pending install scripts (e.g., tree-sitter native builds)
+            if [ -d "$HOME/.pi/agent" ]; then
+              (cd "$HOME/.pi/agent" && npm approve-scripts --allow-scripts-pending 2>/dev/null || true)
+            fi
           else
             echo "Warning: 'pi' not found in PATH; skipping package installation." >&2
           fi
