@@ -669,6 +669,18 @@ in
               and installed via `pi install` during activation.
             '';
           };
+
+          auth = lib.mkOption {
+            type = jsonFormat.type;
+            default = { };
+            description = "Content of ~/.pi/agent/auth.json (provider authentication).";
+          };
+
+          permissionConfig = lib.mkOption {
+            type = jsonFormat.type;
+            default = { };
+            description = "Content of ~/.pi/agent/extensions/pi-permission-system/config.json.";
+          };
         };
       };
       default = { };
@@ -901,6 +913,17 @@ in
             echo "Warning: 'pi' not found in PATH; skipping package installation." >&2
           fi
         '';
+      })
+
+      # Pi: auth.json
+      (lib.mkIf (builtins.elem "pi" cfg.agents && cfg.pi.auth != { }) {
+        home.file.".pi/agent/auth.json".source = jsonFormat.generate "pi-auth.json" cfg.pi.auth;
+      })
+
+      # Pi: pi-permission-system config
+      (lib.mkIf (builtins.elem "pi" cfg.agents && cfg.pi.permissionConfig != { }) {
+        home.file.".pi/agent/extensions/pi-permission-system/config.json".source =
+          jsonFormat.generate "pi-permission-system-config.json" cfg.pi.permissionConfig;
       })
     ]
   );
