@@ -925,6 +925,32 @@ in
         home.file.".pi/agent/extensions/pi-permission-system/config.json".source =
           jsonFormat.generate "pi-permission-system-config.json" cfg.pi.permissionConfig;
       })
+
+      # Pi: mcp.json from shared mcpServers
+      (lib.mkIf (builtins.elem "pi" cfg.agents && cfg.mcpServers != { }) {
+        home.file.".pi/agent/mcp.json".source = jsonFormat.generate "pi-mcp.json" {
+          mcpServers = lib.mapAttrs (
+            name: server:
+            let
+              # Keep only fields pi-mcp-adapter understands
+              relevant = lib.filterAttrs (
+                k: _:
+                builtins.elem k [
+                  "url"
+                  "headers"
+                  "env"
+                  "command"
+                  "args"
+                  "enabled"
+                ]
+              ) server;
+              # Map opencode's "environment" field to pi's "env"
+              withEnv = if server ? environment then relevant // { env = server.environment; } else relevant;
+            in
+            withEnv
+          ) cfg.mcpServers;
+        };
+      })
     ]
   );
 }
