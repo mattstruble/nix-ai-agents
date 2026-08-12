@@ -653,11 +653,11 @@ in
           };
 
           extensions = lib.mkOption {
-            type = lib.types.listOf lib.types.path;
-            default = [ ];
+            type = lib.types.attrsOf lib.types.path;
+            default = { };
             description = ''
-              List of paths to .ts extension files. Each is symlinked into
-              ~/.pi/agent/extensions/<basename>.
+              Attrset of extension files. Keys are filenames (e.g. "skill-enforcer.ts"),
+              values are source paths. Each is symlinked into ~/.pi/agent/extensions/<key>.
             '';
           };
 
@@ -880,16 +880,14 @@ in
         home.file.".pi/agent/AGENTS.md".source = cfg.pi.agentsFile;
       })
 
-      # Pi: extensions — symlink each .ts file by basename
-      (lib.mkIf (builtins.elem "pi" cfg.agents && cfg.pi.extensions != [ ]) {
-        home.file = lib.listToAttrs (
-          map (
-            ext:
-            lib.nameValuePair ".pi/agent/extensions/${builtins.baseNameOf ext}" {
-              source = ext;
-            }
-          ) cfg.pi.extensions
-        );
+      # Pi: extensions — symlink each .ts file by key name
+      (lib.mkIf (builtins.elem "pi" cfg.agents && cfg.pi.extensions != { }) {
+        home.file = lib.mapAttrs' (
+          name: source:
+          lib.nameValuePair ".pi/agent/extensions/${name}" {
+            inherit source;
+          }
+        ) cfg.pi.extensions;
       })
 
       # Pi: install declared packages via activation script
