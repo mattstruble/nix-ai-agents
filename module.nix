@@ -12,6 +12,11 @@ let
   # Agents under XDG config use xdg.configFile; others use home.file
   xdgAgents = [ "opencode" ];
 
+  # Non-XDG agents that support skill profiles via environment variables
+  # (e.g. PI_SKILL_PATHS). These receive only base skills in their global
+  # directory; profiled skills are loaded at runtime from skill-profiles/.
+  profileAwareAgents = [ "pi" ];
+
   agentSkillsPath = {
     opencode = "opencode/skills";
     claude = ".claude/skills";
@@ -386,9 +391,17 @@ let
         let
           urlHash = builtins.hashString "sha256" "${entry.source}#${entry.ref}#${entry.rev}";
           filterSnippet = mkSkillFilter { inherit (entry) include exclude; };
-          # Non-opencode agent dirs (claude, cursor) — always get all git skills
-          nonOpencodeAgentDirs = builtins.filter (d: d != agentSkillsAbsPath "opencode") agentDirs;
-          nonOpencodeStr = lib.concatMapStringsSep " " (d: ''"${d}"'') nonOpencodeAgentDirs;
+          # Profile-unaware non-XDG agents (claude, cursor) — always get all git skills
+          profileUnawareAgentDirs = builtins.filter (
+            d: d != agentSkillsAbsPath "opencode"
+              && !builtins.elem d (map agentSkillsAbsPath profileAwareAgents)
+          ) agentDirs;
+          profileUnawareStr = lib.concatMapStringsSep " " (d: ''"${d}"'') profileUnawareAgentDirs;
+          # Profile-aware non-XDG agents (pi) — base skills to global dir, profiled to profile dirs
+          profileAwareAgentDirs = builtins.filter (
+            d: builtins.elem d (map agentSkillsAbsPath profileAwareAgents)
+          ) agentDirs;
+          profileAwareStr = lib.concatMapStringsSep " " (d: ''"${d}"'') profileAwareAgentDirs;
           # Per-profile target dirs for opencode (build-time known from entry.profiles)
           opencodeTargets =
             if !hasOpencode then
@@ -419,12 +432,26 @@ let
                   ln -snf "$skill_dir" "${opencodeProfilesBase}/all/$name"
                 ''}
               ''}
-              # Deploy to non-opencode agent dirs (claude, cursor) — always all skills
-              ${lib.optionalString (nonOpencodeAgentDirs != [ ]) ''
-                for _dir in ${nonOpencodeStr}; do
+              # Deploy to profile-unaware agents (claude, cursor) — all git skills
+              ${lib.optionalString (profileUnawareAgentDirs != [ ]) ''
+                for _dir in ${profileUnawareStr}; do
                   ln -snf "$skill_dir" "$_dir/$name"
                 done
               ''}
+              # Deploy to profile-aware agents (pi) — base only; profiled go to profile dirs
+              ${lib.optionalString (profileAwareAgentDirs != [ ]) (
+                if entry.profiles == null then ''
+                  for _dir in ${profileAwareStr}; do
+                    ln -snf "$skill_dir" "$_dir/$name"
+                  done
+                '' else ''
+                  # Profiled entry — deploy to skill-profiles/<name>/ (shared with opencode)
+                  ${lib.concatMapStringsSep "\n" (p: ''
+                    mkdir -p "${opencodeProfilesBase}/${p}"
+                    ln -snf "$skill_dir" "${opencodeProfilesBase}/${p}/$name"
+                  '') entry.profiles}
+                ''
+              )}
             done
           fi
         '';
@@ -810,12 +837,16 @@ in
             }
           );
 
-        # Home-managed agents (claude, cursor) — receive all skills (base + profiled)
+        # Home-managed agents — profile-aware ones (pi) get base skills only;
+        # profile-unaware ones (claude, cursor) get all skills (base + profiled).
         home.file = lib.listToAttrs (
           map (
             agent:
             lib.nameValuePair agentSkillsPath.${agent} {
-              source = mergedAllSkills;
+              source =
+                if builtins.elem agent profileAwareAgents
+                then mergedBaseSkills
+                else mergedAllSkills;
               recursive = true;
             }
           ) (builtins.filter (a: !isXdgAgent a) cfg.agents)
