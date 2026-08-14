@@ -708,6 +708,18 @@ in
             default = { };
             description = "Content of ~/.pi/agent/extensions/pi-permission-system/config.json.";
           };
+
+          modelMap = lib.mkOption {
+            type = jsonFormat.type;
+            default = { };
+            description = ''
+              Model mapping for Pi agent profiles and dispatch.
+              Generated as ~/.pi/agent/model-map.json.
+              Schema: { default, small_model, <agent-name>: <model-id> }.
+              The agent-profiles extension reads this to set the session model
+              on profile switch and rewrite dispatch tool calls.
+            '';
+          };
         };
       };
       default = { };
@@ -959,6 +971,12 @@ in
       (lib.mkIf (builtins.elem "pi" cfg.agents && cfg.pi.permissionConfig != { }) {
         home.file.".pi/agent/extensions/pi-permission-system/config.json".source =
           jsonFormat.generate "pi-permission-system-config.json" cfg.pi.permissionConfig;
+      })
+
+      # Pi: model-map.json for agent-profiles extension
+      (lib.mkIf (builtins.elem "pi" cfg.agents && cfg.pi.modelMap != { }) {
+        home.file.".pi/agent/model-map.json".source =
+          jsonFormat.generate "pi-model-map.json" cfg.pi.modelMap;
       })
 
     ]
