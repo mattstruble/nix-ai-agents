@@ -294,6 +294,11 @@ let
       # Profile dirs under opencode/skill-profiles/<name>/ and .../all/
       opencodeProfilesBase = "${config.xdg.configHome}/opencode/skill-profiles";
 
+      # Profile dirs under ~/.pi/agent/skill-profiles/<name>/ for profile-aware agents
+      piSkillProfilesBase = "${config.home.homeDirectory}/.pi/agent/skill-profiles";
+
+      hasPi = builtins.any (a: builtins.elem a profileAwareAgents) cfg.agents;
+
       # Space-separated list of declared profile names for use in a bash for-loop (build-time)
       profileNamesStr = lib.concatMapStringsSep " " (n: ''"${n}"'') (
         builtins.attrNames cfg.opencode.profiles
@@ -430,6 +435,11 @@ let
                   # Deploy to skill-profiles/all/ (opencode)
                   mkdir -p "${opencodeProfilesBase}/all"
                   ln -snf "$skill_dir" "${opencodeProfilesBase}/all/$name"
+                  ${lib.optionalString hasPi ''
+                    # Deploy to skill-profiles/all/ (pi)
+                    mkdir -p "${piSkillProfilesBase}/all"
+                    ln -snf "$skill_dir" "${piSkillProfilesBase}/all/$name"
+                  ''}
                 ''}
               ''}
               # Deploy to profile-unaware agents (claude, cursor) — all git skills
@@ -445,10 +455,14 @@ let
                     ln -snf "$skill_dir" "$_dir/$name"
                   done
                 '' else ''
-                  # Profiled entry — deploy to skill-profiles/<name>/ (shared with opencode)
+                  # Profiled entry — deploy to skill-profiles/<name>/ for opencode and pi
                   ${lib.concatMapStringsSep "\n" (p: ''
                     mkdir -p "${opencodeProfilesBase}/${p}"
                     ln -snf "$skill_dir" "${opencodeProfilesBase}/${p}/$name"
+                    ${lib.optionalString hasPi ''
+                      mkdir -p "${piSkillProfilesBase}/${p}"
+                      ln -snf "$skill_dir" "${piSkillProfilesBase}/${p}/$name"
+                    ''}
                   '') entry.profiles}
                 ''
               )}
@@ -484,6 +498,19 @@ let
         # Clean stale git symlinks from skill-profiles/<name>/ and skill-profiles/all/
         for _profile_name in ${profileNamesStr} all; do
           _dir="${opencodeProfilesBase}/$_profile_name"
+          [ -d "$_dir" ] || continue
+          for _entry in "$_dir"/*; do
+            [ -L "$_entry" ] || continue
+            case "$(readlink "$_entry")" in
+              "${cacheDir}"/*) rm -f "$_entry" ;;
+            esac
+          done
+        done
+      ''}
+      ${lib.optionalString hasPi ''
+        # Clean stale git symlinks from pi skill-profiles/<name>/ and skill-profiles/all/
+        for _profile_name in ${profileNamesStr} all; do
+          _dir="${piSkillProfilesBase}/$_profile_name"
           [ -d "$_dir" ] || continue
           for _entry in "$_dir"/*; do
             [ -L "$_entry" ] || continue
@@ -862,6 +889,22 @@ in
               recursive = true;
             }
           ) (builtins.filter (a: !isXdgAgent a) cfg.agents)
+        )
+        # Per-profile skill directories for profile-aware agents (pi)
+        // lib.optionalAttrs (cfg.opencode.profiles != { } && profileAwareAgents != [ ]) (
+          lib.mapAttrs' (
+            profileName: drv:
+            lib.nameValuePair ".pi/agent/skill-profiles/${profileName}" {
+              source = drv;
+              recursive = true;
+            }
+          ) mergedProfileSkills
+          // {
+            ".pi/agent/skill-profiles/all" = {
+              source = mergedAllSkills;
+              recursive = true;
+            };
+          }
         );
       })
 
