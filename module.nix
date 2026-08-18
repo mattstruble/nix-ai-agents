@@ -247,6 +247,22 @@ let
     let
       agentDirs = map agentSubagentsAbsPath cfg.agents;
       agentDirsStr = lib.concatMapStringsSep " " (d: ''"${d}"'') agentDirs;
+      opencodeDir = agentSubagentsAbsPath "opencode";
+      piDir = agentSubagentsAbsPath "pi";
+      mkPerToolLoop =
+        srcDir: targetDir:
+        ''
+          if [ -d ${lib.escapeShellArg srcDir} ]; then
+            for _md in ${lib.escapeShellArg srcDir}/*.md; do
+              [ -f "$_md" ] || continue
+              _filename="$(basename "$_md")"
+              ln -snf "$_md" "${targetDir}/$_filename"
+              printf '%s\0' "${targetDir}/$_filename" >> ${lib.escapeShellArg subagentsManifestFile}
+            done
+          else
+            echo "Warning: subagents directory ${lib.escapeShellArg srcDir} does not exist; skipping." >&2
+          fi
+        '';
     in
     ''
       _SUBAGENT_DIRS=(${agentDirsStr})
@@ -269,7 +285,7 @@ let
       # Clear manifest for fresh write
       : > ${lib.escapeShellArg subagentsManifestFile}
 
-      # Deploy subagent symlinks
+      # Deploy shared subagent symlinks (to all agent tool directories)
       ${lib.concatMapStringsSep "\n" (srcDir: ''
         if [ -d ${lib.escapeShellArg srcDir} ]; then
           for _md in ${lib.escapeShellArg srcDir}/*.md; do
@@ -284,6 +300,12 @@ let
           echo "Warning: subagents directory ${lib.escapeShellArg srcDir} does not exist; skipping." >&2
         fi
       '') cfg.subagents}
+
+      # Deploy opencode-specific subagents (only to opencode agents directory)
+      ${lib.concatMapStringsSep "\n" (srcDir: mkPerToolLoop srcDir opencodeDir) cfg.opencode.subagents}
+
+      # Deploy pi-specific subagents (only to pi agents directory)
+      ${lib.concatMapStringsSep "\n" (srcDir: mkPerToolLoop srcDir piDir) cfg.pi.subagents}
     '';
 
   gitSkillsScript =
@@ -629,6 +651,20 @@ in
             '';
           };
 
+          subagents = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = ''
+              List of absolute paths to directories containing agent definition
+              markdown files (.md). Each .md file is symlinked into the opencode
+              agents directory ONLY, after shared subagents are deployed.
+              Later entries override earlier ones on name collision (ln -snf).
+
+              Use this for opencode-specific agents that should not be deployed
+              to other tools.
+            '';
+          };
+
           agentsFile = lib.mkOption {
             type = lib.types.nullOr lib.types.path;
             default = null;
@@ -691,6 +727,20 @@ in
             description = ''
               Configuration attrset serialized to ~/.pi/agent/settings.json.
               The packages list is merged in from pi.packages.
+            '';
+          };
+
+          subagents = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = ''
+              List of absolute paths to directories containing agent definition
+              markdown files (.md). Each .md file is symlinked into the pi
+              agents directory ONLY, after shared subagents are deployed.
+              Later entries override earlier ones on name collision (ln -snf).
+
+              Use this for pi-specific agents that contain pi frontmatter
+              (e.g. permission:) that would break other tools like opencode.
             '';
           };
 
@@ -810,6 +860,27 @@ in
           assertion = lib.hasPrefix "/" dir && builtins.match "[^\n\r]+" dir != null;
           message = "programs.ai-agents.subagents[${toString i}]: must be an absolute path without newlines.";
         }) cfg.subagents)
+        # opencode.subagents entries must be absolute paths without newlines
+        ++ (lib.imap0 (i: dir: {
+          assertion = lib.hasPrefix "/" dir && builtins.match "[^\n\r]+" dir != null;
+          message = "programs.ai-agents.opencode.subagents[${toString i}]: must be an absolute path without newlines.";
+        }) cfg.opencode.subagents)
+        # pi.subagents entries must be absolute paths without newlines
+        ++ (lib.imap0 (i: dir: {
+          assertion = lib.hasPrefix "/" dir && builtins.match "[^\n\r]+" dir != null;
+          message = "programs.ai-agents.pi.subagents[${toString i}]: must be an absolute path without newlines.";
+        }) cfg.pi.subagents)
+        # per-tool subagents require that tool to be in cfg.agents
+        ++ [
+          {
+            assertion = cfg.opencode.subagents == [ ] || builtins.elem "opencode" cfg.agents;
+            message = "programs.ai-agents.opencode.subagents is set but 'opencode' is not in programs.ai-agents.agents.";
+          }
+          {
+            assertion = cfg.pi.subagents == [ ] || builtins.elem "pi" cfg.agents;
+            message = "programs.ai-agents.pi.subagents is set but 'pi' is not in programs.ai-agents.agents.";
+          }
+        ]
         # skill profiles must reference declared opencode.profiles names
         ++ [
           {
